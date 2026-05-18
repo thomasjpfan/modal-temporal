@@ -3,10 +3,19 @@ import sys
 import asyncio
 import inspect
 import modal
+import dataclasses
 from functools import wraps
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
-from typing import Coroutine, Any, Callable, ParamSpec, TypeVar, Sequence
+from typing import (
+    Coroutine,
+    Any,
+    Callable,
+    ParamSpec,
+    TypeVar,
+    Sequence,
+    dataclass_transform,
+)
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.worker import (
@@ -124,6 +133,13 @@ def modal_activity(
     return decorate
 
 
+# modal.parameter() returns a modal.cls._Parameter whose .default is a
+# _NO_DEFAULT sentinel instance when no default was given.
+_MODAL_PARAM = type(modal.parameter())
+_MODAL_NO_DEFAULT = type(modal.parameter().default)
+
+
+@dataclass_transform(field_specifiers=(modal.parameter,))
 def modal_activity_cls(
     app: modal.App, **modal_opts: Any
 ) -> Callable[[type[T]], type[T]]:
@@ -133,10 +149,33 @@ def modal_activity_cls(
     symbol (no serialized=True; the decorator re-runs on the remote import and
     re-binds it), and recorded in REGISTRY. Returns the class unchanged.
 
+    Params may be declared either with a normal __init__ or Modal-style as
+    `name: T = modal.parameter()`; the latter is turned into a dataclass
+    __init__ so the activity stays a normal, instantiable class.
+
     Assumes bare @activity.defn on the methods => activity name == method
     __name__ (same convention as @modal_activity)."""
 
     def decorate(cls: type[T]) -> type[T]:
+        # Modal-style params: synthesize a dataclass __init__ so the queuer can
+        # build an instance and the interceptor can read vars(instance). The
+        # signature logic below is then identical for both styles.
+        if "__init__" not in cls.__dict__:
+            cls_anns = dict(getattr(cls, "__annotations__", {}))
+            cls_attrs = dict(vars(cls))
+            params = {
+                n: cls_attrs[n]
+                for n in cls_anns
+                if isinstance(cls_attrs.get(n), _MODAL_PARAM)
+            }
+            if params:
+                for n, pobj in params.items():
+                    if isinstance(pobj.default, _MODAL_NO_DEFAULT):
+                        delattr(cls, n)  # required dataclass field
+                    else:
+                        setattr(cls, n, pobj.default)
+                dataclasses.dataclass(cls)
+
         # Dynamically add `modal.parameters`
         anns: dict[str, Any] = {}
         ns: dict[str, Any] = {}

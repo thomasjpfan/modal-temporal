@@ -47,8 +47,7 @@ async def add_two(value: int) -> int:
 # Class based activity
 @modal_activity_cls(app, env=env, image=image)
 class SayHello:
-    def __init__(self, greeting: str = "Hello again"):
-        self.greeting = greeting
+    greeting: str = modal.parameter()
 
     @activity.defn
     async def run(self, name: str) -> str:
