@@ -306,7 +306,7 @@ async def run_dispatcher(
     workflows: Sequence[type],
     activities: Sequence[Callable],
     max_workers: int = 4,
-    **worker_kwargs: Any,
+    worker_kwargs: dict,
 ) -> None:
     """Run the Temporal worker that dispatches activities to Modal.
 
