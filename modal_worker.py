@@ -80,7 +80,7 @@ class SayHelloWorkflow:
 async def queuer():
     """Pulls task from Temporal's task queue and immediately places it on Modal input queue.
 
-    This function does not actually run the Temporal activity and should not take many resourc.es
+    This function does not actually run the Temporal activity and should not take many resources.
 
     An alternative is to run this queuer on a machine external to Modal.
     """
