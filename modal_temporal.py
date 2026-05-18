@@ -5,10 +5,12 @@ import inspect
 import modal
 from functools import wraps
 from dataclasses import dataclass
-from typing import Coroutine, Any, Callable, ParamSpec, TypeVar
+from concurrent.futures import ThreadPoolExecutor
+from typing import Coroutine, Any, Callable, ParamSpec, TypeVar, Sequence
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.worker import (
+    Worker,
     Interceptor,
     ActivityInboundInterceptor,
     ExecuteActivityInput,
@@ -135,6 +137,7 @@ def modal_activity_cls(
     __name__ (same convention as @modal_activity)."""
 
     def decorate(cls: type[T]) -> type[T]:
+        # Dynamically add `modal.parameters`
         anns: dict[str, Any] = {}
         ns: dict[str, Any] = {}
         param_names: list[str] = []
@@ -155,11 +158,13 @@ def modal_activity_cls(
             )
         ns["__annotations__"] = anns
 
+        # Dynamically add a `modal.enter()`
         async def _start(self):
             self._activity = cls(**{n: getattr(self, n) for n in param_names})
 
         ns["start"] = modal.enter()(_start)
 
+        # Dynamically add methods from activities
         def make_method(method_name: str):
             async def _run(self, task_token: bytes, args: Any):
                 client = await get_temporal_client()
@@ -239,3 +244,41 @@ class DispatchInterceptor(Interceptor):
         self, next: ActivityInboundInterceptor
     ) -> ActivityInboundInterceptor:
         return DispatchActivityInterceptor(next, self._app_name)
+
+
+async def run_dispatcher(
+    app_name: str,
+    *,
+    task_queue: str,
+    workflows: Sequence[type],
+    activities: Sequence[Callable],
+    max_workers: int = 4,
+    **worker_kwargs: Any,
+) -> None:
+    """Run the Temporal worker that dispatches activities to Modal.
+
+    Owns only the dispatcher plumbing: the Temporal client, the
+    DispatchInterceptor, and a thread pool so sync activities can run. Extra
+    keyword args are forwarded to temporalio's Worker, so callers can set any
+    Worker parameter. Special-cased so the plumbing is not lost:
+    - `interceptors` you pass are appended after the DispatchInterceptor.
+    - `activity_executor`, if given, replaces the default thread pool.
+    """
+    client = await get_temporal_client()
+    interceptors = [
+        DispatchInterceptor(app_name),
+        *worker_kwargs.pop("interceptors", []),
+    ]
+    worker_kwargs.setdefault(
+        "activity_executor", ThreadPoolExecutor(max_workers=max_workers)
+    )
+    worker = Worker(
+        client,
+        task_queue=task_queue,
+        workflows=list(workflows),
+        activities=list(activities),
+        interceptors=interceptors,
+        **worker_kwargs,
+    )
+    print(f"[dispatcher] worker on {task_queue!r}; activities run on Modal")
+    await worker.run()

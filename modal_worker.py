@@ -1,19 +1,16 @@
 import re
 import os
 from datetime import timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 import modal
 from temporalio import activity, workflow
 from async_lru import alru_cache
 from temporalio.client import Client
-from temporalio.worker import Worker
 
 from modal_temporal import (
-    DispatchInterceptor,
-    get_temporal_client,
     modal_activity,
     modal_activity_cls,
+    run_dispatcher,
 )
 
 APP_NAME = "temporal-testing"
@@ -84,19 +81,12 @@ async def queuer():
 
     An alternative is to run this queuer on a machine external to Modal.
     """
-    client = await get_temporal_client()
-    greeting_activity = SayHello(greeting="You are great")
-    worker = Worker(
-        client,
+    await run_dispatcher(
+        APP_NAME,
         task_queue="my-task-queue",
         workflows=[SayHelloWorkflow],
-        activities=[greet, word_count, add_two, greeting_activity.run],
-        interceptors=[DispatchInterceptor(APP_NAME)],
-        # Add a thread pool executor so we can run sync activities
-        activity_executor=ThreadPoolExecutor(max_workers=4),
+        activities=[greet, word_count, add_two, SayHello(greeting="You are great").run],
     )
-    print("Dispatcher worker started. Activities will be completed by a Modal function")
-    await worker.run()
 
 
 if __name__ == "__main__":
