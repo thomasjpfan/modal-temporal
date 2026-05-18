@@ -4,8 +4,6 @@ from datetime import timedelta
 
 import modal
 from temporalio import workflow
-from async_lru import alru_cache
-from temporalio.client import Client
 
 from modal_temporal import (
     modal_activity,
