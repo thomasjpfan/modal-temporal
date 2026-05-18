@@ -67,6 +67,7 @@ async def add_two(value: int) -> int:
 add_two_runner = app.function(env=env, image=image)(modal_activity(add_two))
 
 
+# Class based activity
 class SayHello:
     def __init__(self, greeting: str = "Hello again"):
         self.greeting = greeting
