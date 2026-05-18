@@ -3,13 +3,14 @@ import os
 from datetime import timedelta
 
 import modal
-from temporalio import activity, workflow
+from temporalio import workflow
 from async_lru import alru_cache
 from temporalio.client import Client
 
 from modal_temporal import (
     modal_activity,
     modal_activity_cls,
+    modal_activity_method,
     run_dispatcher,
 )
 
@@ -23,7 +24,7 @@ image = (
 )
 
 
-env: dict[str, str] = {
+env: dict[str, str | None] = {
     "TEMPORAL_SERVER": os.environ["TEMPORAL_SERVER"],
     "TEMPORAL_NAMESPACE": os.environ["TEMPORAL_NAMESPACE"],
 }
@@ -49,7 +50,7 @@ async def add_two(value: int) -> int:
 class SayHello:
     greeting: str = modal.parameter()
 
-    @activity.defn
+    @modal_activity_method
     async def run(self, name: str) -> str:
         return f"{self.greeting}, {name}!"
 

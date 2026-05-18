@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 import asyncio
 import inspect
 import modal
@@ -133,6 +134,18 @@ def modal_activity(
     return decorate
 
 
+_ACTIVITY_METHOD = "__modal_activity_method__"
+
+
+def modal_activity_method(fn: Callable[P, R]) -> Callable[P, R]:
+    """Mark a method of a @modal_activity_cls class as a Temporal activity.
+    Applies a bare @activity.defn (name == method __name__) and tags it so the
+    class decorator selects exactly these methods."""
+    temporal_method: Callable[P, R] = activity.defn(fn)
+    setattr(temporal_method, _ACTIVITY_METHOD, True)
+    return temporal_method
+
+
 # modal.parameter() returns a modal.cls._Parameter whose .default is a
 # _NO_DEFAULT sentinel instance when no default was given.
 _MODAL_PARAM = type(modal.parameter())
@@ -215,8 +228,8 @@ def modal_activity_cls(
 
         methods = [
             n
-            for n, fn in vars(cls).items()
-            if not n.startswith("_") and inspect.iscoroutinefunction(fn)
+            for n, fn in dict(vars(cls)).items()
+            if getattr(fn, _ACTIVITY_METHOD, False)
         ]
         for n in methods:
             ns[n] = make_method(n)
@@ -264,6 +277,7 @@ class DispatchActivityInterceptor(ActivityInboundInterceptor):
         if entry.is_class:
             # input.fn is a bound method, e.g. SayHello().run. The instance's
             # attributes map to the Modal Cls parameters.
+            assert isinstance(input.fn, types.MethodType)
             instance = input.fn.__self__
             modal_cls = await get_modal_cls(self._app_name, entry.modal_name)
             handle = getattr(modal_cls(**vars(instance)), input.fn.__name__)
