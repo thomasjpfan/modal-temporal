@@ -82,6 +82,10 @@ def get_name(activity_name: str) -> str:
     return f"{activity_name}_runner"
 
 
+def get_cls_name(class_name: str) -> str:
+    return f"{class_name}Runner"
+
+
 def modal_activity(f: Callable):
     @wraps(f)
     async def wrapper(task_token: bytes, /, args: Any):
@@ -99,22 +103,44 @@ async def get_modal_function(app_name: str, func_name: str) -> modal.Function:
     return await modal.Function.from_name(app_name, func_name).hydrate.aio()
 
 
+@alru_cache()
+async def get_modal_cls(app_name: str, cls_name: str) -> modal.Cls:
+    return await modal.Cls.from_name(app_name, cls_name).hydrate.aio()
+
+
 class DispatchActivityInterceptor(ActivityInboundInterceptor):
     def __init__(self, next: ActivityInboundInterceptor, app_name: str) -> None:
         super().__init__(next)
         self._app_name = app_name
 
     async def execute_activity(self, input: ExecuteActivityInput) -> Any:
-        info = activity.info()
-        task_token = info.task_token
-        activity_name = input.fn.__name__
+        task_token = activity.info().task_token
         args = list(input.args)
 
-        key = get_name(activity_name)
-        modal_func = await get_modal_function(self._app_name, key)
+        if inspect.ismethod(input.fn):
+            # Class-based: input.fn is a bound method, e.g. SayHello().run.
+            # The instance's attributes map to the Modal Cls parameters.
+            instance = input.fn.__self__
+            cls_name = type(instance).__name__
+            method_name = input.fn.__name__
+            params = vars(instance)
+            modal_cls = await get_modal_cls(self._app_name, get_cls_name(cls_name))
+            method = getattr(modal_cls(**params), method_name)
+            print(
+                f"[dispatcher] class activity={cls_name}.{method_name} "
+                f"params={params} args={args} -> external worker"
+            )
+            await method.spawn.aio(task_token, args)
+        else:
+            activity_name = input.fn.__name__
+            modal_func = await get_modal_function(
+                self._app_name, get_name(activity_name)
+            )
+            print(
+                f"[dispatcher] activity={activity_name} args={args} -> external worker"
+            )
+            await modal_func.spawn.aio(task_token, args)
 
-        print(f"[dispatcher] activity={activity_name} args={args} -> external worker")
-        await modal_func.spawn.aio(task_token, args)
         activity.raise_complete_async()
 
 

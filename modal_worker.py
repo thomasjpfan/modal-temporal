@@ -67,16 +67,16 @@ async def add_two(value: int) -> int:
 add_two_runner = app.function(env=env, image=image)(modal_activity(add_two))
 
 
-@activity.defn
 class SayHello:
     def __init__(self, greeting: str = "Hello again"):
         self.greeting = greeting
 
+    @activity.defn
     async def run(self, name: str) -> str:
         return f"{self.greeting}, {name}!"
 
 
-@app.cls()
+@app.cls(env=env,image=image)
 class SayHelloRunner:
     greeting: str = modal.parameter()
 
@@ -86,6 +86,7 @@ class SayHelloRunner:
 
     @modal.method()
     async def run(self, task_token: bytes, args: Any) -> None:
+        """Must be the same name as the method in the `SayHello` activity."""
         client = await get_temporal_client()
         return await run_activity(self.worker_obj.run, args, client, task_token)
 
@@ -122,7 +123,7 @@ async def queuer():
         client,
         task_queue="my-task-queue",
         workflows=[SayHelloWorkflow],
-        activities=[greet, word_count, add_two, greeting_activity],
+        activities=[greet, word_count, add_two, greeting_activity.run],
         interceptors=[DispatchInterceptor(APP_NAME)],
         # Add a thread pool executor so we can run sync activities
         activity_executor=ThreadPoolExecutor(max_workers=4),
