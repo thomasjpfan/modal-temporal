@@ -1,8 +1,10 @@
 import os
+import sys
 import asyncio
 import inspect
 import modal
 from functools import wraps
+from dataclasses import dataclass
 from typing import Coroutine, Any, Callable, ParamSpec, TypeVar
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -78,24 +80,53 @@ async def get_temporal_client() -> Client:
     )
 
 
-def get_name(activity_name: str) -> str:
-    return f"{activity_name}_runner"
+@dataclass(frozen=True)
+class _Runner:
+    modal_name: str  # name the handler is deployed under in the Modal app
+    is_class: bool
 
 
-def get_cls_name(class_name: str) -> str:
-    return f"{class_name}Runner"
+# Temporal activity_type -> how the dispatcher reaches its Modal handler.
+# Populated at import time, read by DispatchActivityInterceptor. There is no
+# naming convention: each activity records its handler here explicitly.
+REGISTRY: dict[str, _Runner] = {}
 
 
-def modal_activity(f: Callable):
-    @wraps(f)
-    async def wrapper(task_token: bytes, /, args: Any):
-        client = await get_temporal_client()
-        return await run_activity(f, args, client, task_token)
+def modal_activity(app: modal.App, **modal_opts):
+    """Register a function as a Temporal activity AND build + record the Modal
+    function that runs it. Returns the Temporal activity to pass to the Worker."""
 
-    func_name = get_name(f.__name__)
-    wrapper.__name__ = func_name
-    wrapper.__qualname__ = func_name
-    return wrapper
+    def decorate(f: Callable) -> Callable:
+        temporal_activity = activity.defn(f)
+
+        @wraps(f)
+        async def runner(task_token: bytes, /, args: Any):
+            client = await get_temporal_client()
+            return await run_activity(f, args, client, task_token)
+
+        modal_name = f"{f.__name__}_runner"
+        runner.__name__ = runner.__qualname__ = modal_name
+        # Modal references a non-serialized function by f"{module}:{qualname}"
+        # and re-imports that module in the container. @wraps put the activity's
+        # module on `runner`; bind it there as a real global so the lookup
+        # resolves. The decorator re-runs on the remote import and re-binds it.
+        setattr(sys.modules[f.__module__], modal_name, runner)
+        app.function(**modal_opts)(runner)
+
+        REGISTRY[f.__name__] = _Runner(modal_name, is_class=False)
+        return temporal_activity
+
+    return decorate
+
+
+def register_modal_cls(activity_method: Callable, runner_cls: type) -> None:
+    """Explicitly pair a class-based activity method (e.g. SayHello.run) with
+    its @app.cls() runner. Keyed by the Temporal activity name so it matches
+    activity.info().activity_type at dispatch time."""
+    defn = activity._Definition.from_callable(activity_method)
+    if defn is None:
+        raise ValueError(f"{activity_method!r} is not an @activity.defn")
+    REGISTRY[defn.name] = _Runner(runner_cls.__name__, is_class=True)
 
 
 @alru_cache()
@@ -114,33 +145,23 @@ class DispatchActivityInterceptor(ActivityInboundInterceptor):
         self._app_name = app_name
 
     async def execute_activity(self, input: ExecuteActivityInput) -> Any:
-        task_token = activity.info().task_token
+        info = activity.info()
+        task_token = info.task_token
         args = list(input.args)
 
-        if inspect.ismethod(input.fn):
-            # Class-based: input.fn is a bound method, e.g. SayHello().run.
-            # The instance's attributes map to the Modal Cls parameters.
-            instance = input.fn.__self__
-            cls_name = type(instance).__name__
-            method_name = input.fn.__name__
-            params = vars(instance)
-            modal_cls = await get_modal_cls(self._app_name, get_cls_name(cls_name))
-            method = getattr(modal_cls(**params), method_name)
-            print(
-                f"[dispatcher] class activity={cls_name}.{method_name} "
-                f"params={params} args={args} -> external worker"
-            )
-            await method.spawn.aio(task_token, args)
-        else:
-            activity_name = input.fn.__name__
-            modal_func = await get_modal_function(
-                self._app_name, get_name(activity_name)
-            )
-            print(
-                f"[dispatcher] activity={activity_name} args={args} -> external worker"
-            )
-            await modal_func.spawn.aio(task_token, args)
+        entry = REGISTRY[info.activity_type]
 
+        if entry.is_class:
+            # input.fn is a bound method, e.g. SayHello().run. The instance's
+            # attributes map to the Modal Cls parameters.
+            instance = input.fn.__self__
+            modal_cls = await get_modal_cls(self._app_name, entry.modal_name)
+            handle = getattr(modal_cls(**vars(instance)), input.fn.__name__)
+        else:
+            handle = await get_modal_function(self._app_name, entry.modal_name)
+
+        print(f"[dispatcher] {info.activity_type} -> {entry.modal_name} args={args}")
+        await handle.spawn.aio(task_token, args)
         activity.raise_complete_async()
 
 

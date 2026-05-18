@@ -15,6 +15,7 @@ from modal_temporal import (
     DispatchInterceptor,
     get_temporal_client,
     modal_activity,
+    register_modal_cls,
 )
 
 APP_NAME = "temporal-testing"
@@ -33,38 +34,19 @@ env: dict[str, str] = {
 }
 
 
-@activity.defn
+@modal_activity(app, env=env, image=image, cpu=0.5)
 async def greet(name: str) -> str:
     return f"Hello {name}"
 
 
-@app.function(env=env, image=image, cpu=0.5)
-async def greet_runner(task_token: bytes, args: Any) -> None:
-    """Runs the `greet` activity.
-
-    Note that, the dispatcher assumes that the modal function is named `{activity_name}_runner`."""
-    client = await get_temporal_client()
-    return await run_activity(greet, args, client, task_token)
-
-
-@activity.defn
+@modal_activity(app, env=env, image=image, cpu=1)
 def word_count(text: str) -> int:
     return len(re.findall(r"\b[a-zA-Z]+\b", text))
 
 
-# Does the same as above, but with more syntactic sugar.
-# The function **must** be named `{activity_name}_runner`
-word_count_runner = app.function(env=env, image=image, cpu=1)(
-    modal_activity(word_count)
-)
-
-
-@activity.defn
+@modal_activity(app, env=env, image=image)
 async def add_two(value: int) -> int:
     return value + 2
-
-
-add_two_runner = app.function(env=env, image=image)(modal_activity(add_two))
 
 
 # Class based activity
@@ -90,6 +72,9 @@ class SayHelloRunner:
         """Must be the same name as the method in the `SayHello` activity."""
         client = await get_temporal_client()
         return await run_activity(self.worker_obj.run, args, client, task_token)
+
+
+register_modal_cls(SayHello.run, SayHelloRunner)
 
 
 @workflow.defn
