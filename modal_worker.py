@@ -1,7 +1,6 @@
 import re
 import os
 from datetime import timedelta
-from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
 import modal
@@ -11,11 +10,10 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from modal_temporal import (
-    run_activity,
     DispatchInterceptor,
     get_temporal_client,
     modal_activity,
-    register_modal_cls,
+    modal_activity_cls,
 )
 
 APP_NAME = "temporal-testing"
@@ -50,6 +48,7 @@ async def add_two(value: int) -> int:
 
 
 # Class based activity
+@modal_activity_cls(app, env=env, image=image)
 class SayHello:
     def __init__(self, greeting: str = "Hello again"):
         self.greeting = greeting
@@ -57,24 +56,6 @@ class SayHello:
     @activity.defn
     async def run(self, name: str) -> str:
         return f"{self.greeting}, {name}!"
-
-
-@app.cls(env=env,image=image)
-class SayHelloRunner:
-    greeting: str = modal.parameter()
-
-    @modal.enter()
-    async def start(self):
-        self.worker_obj = SayHello(greeting=self.greeting)
-
-    @modal.method()
-    async def run(self, task_token: bytes, args: Any) -> None:
-        """Must be the same name as the method in the `SayHello` activity."""
-        client = await get_temporal_client()
-        return await run_activity(self.worker_obj.run, args, client, task_token)
-
-
-register_modal_cls(SayHello.run, SayHelloRunner)
 
 
 @workflow.defn

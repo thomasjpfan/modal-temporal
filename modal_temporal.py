@@ -18,6 +18,7 @@ from async_lru import alru_cache
 
 P = ParamSpec("P")
 R = TypeVar("R")
+T = TypeVar("T")
 
 HEARTBEAT_INTERVAL_SECONDS = 2.0
 
@@ -121,14 +122,77 @@ def modal_activity(
     return decorate
 
 
-def register_modal_cls(activity_method: Callable, runner_cls: type) -> None:
-    """Explicitly pair a class-based activity method (e.g. SayHello.run) with
-    its @app.cls() runner. Keyed by the Temporal activity name so it matches
-    activity.info().activity_type at dispatch time."""
-    defn = activity._Definition.from_callable(activity_method)
-    if defn is None:
-        raise ValueError(f"{activity_method!r} is not an @activity.defn")
-    REGISTRY[defn.name] = _Runner(runner_cls.__name__, is_class=True)
+def modal_activity_cls(
+    app: modal.App, **modal_opts: Any
+) -> Callable[[type[T]], type[T]]:
+    """Class analogue of @modal_activity. Decorate the activity class itself: a
+    runner @app.cls() is generated from its __init__ params and public async
+    methods, bound into the activity's module so Modal can reference it by
+    symbol (no serialized=True; the decorator re-runs on the remote import and
+    re-binds it), and recorded in REGISTRY. Returns the class unchanged.
+
+    Assumes bare @activity.defn on the methods => activity name == method
+    __name__ (same convention as @modal_activity)."""
+
+    def decorate(cls: type[T]) -> type[T]:
+        anns: dict[str, Any] = {}
+        ns: dict[str, Any] = {}
+        param_names: list[str] = []
+        for p in inspect.signature(cls.__init__).parameters.values():
+            if p.name == "self" or p.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            param_names.append(p.name)
+            anns[p.name] = (
+                p.annotation if p.annotation is not inspect.Parameter.empty else Any
+            )
+            ns[p.name] = (
+                modal.parameter()
+                if p.default is inspect.Parameter.empty
+                else modal.parameter(default=p.default)
+            )
+        ns["__annotations__"] = anns
+
+        async def _start(self):
+            self._activity = cls(**{n: getattr(self, n) for n in param_names})
+
+        ns["start"] = modal.enter()(_start)
+
+        def make_method(method_name: str):
+            async def _run(self, task_token: bytes, args: Any):
+                client = await get_temporal_client()
+                return await run_activity(
+                    getattr(self._activity, method_name), args, client, task_token
+                )
+
+            return modal.method()(_run)
+
+        methods = [
+            n
+            for n, fn in vars(cls).items()
+            if not n.startswith("_") and inspect.iscoroutinefunction(fn)
+        ]
+        for n in methods:
+            ns[n] = make_method(n)
+
+        runner_name = f"{cls.__name__}Runner"
+        runner_cls = type(runner_name, (), ns)
+        # Same trick as @modal_activity: make the generated runner a real
+        # f"{module}:{qualname}" symbol in the activity's module so Modal's
+        # by-reference lookup resolves. type() set __module__ to this module;
+        # point it at the activity's module instead.
+        runner_cls.__module__ = cls.__module__
+        runner_cls.__qualname__ = runner_name
+        setattr(sys.modules[cls.__module__], runner_name, runner_cls)
+        app.cls(**modal_opts)(runner_cls)
+
+        for n in methods:
+            REGISTRY[n] = _Runner(runner_name, is_class=True)
+        return cls
+
+    return decorate
 
 
 @alru_cache()
