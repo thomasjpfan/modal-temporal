@@ -92,12 +92,14 @@ class _Runner:
 REGISTRY: dict[str, _Runner] = {}
 
 
-def modal_activity(app: modal.App, **modal_opts):
+def modal_activity(
+    app: modal.App, **modal_opts: Any
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Register a function as a Temporal activity AND build + record the Modal
     function that runs it. Returns the Temporal activity to pass to the Worker."""
 
-    def decorate(f: Callable) -> Callable:
-        temporal_activity = activity.defn(f)
+    def decorate(f: Callable[P, R]) -> Callable[P, R]:
+        temporal_activity: Callable[P, R] = activity.defn(f)
 
         @wraps(f)
         async def runner(task_token: bytes, /, args: Any):
