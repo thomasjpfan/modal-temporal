@@ -40,6 +40,23 @@ P = ParamSpec("P")
 R = TypeVar("R")
 T = TypeVar("T")
 
+# Heartbeat hand-off between the dispatcher and the Modal worker. While an
+# activity waits on Modal's input queue the dispatcher heartbeats on its behalf;
+# once a worker starts it writes _HEARTBEAT_STARTED into the shared modal.Dict to
+# take over, and removes the key entirely when the activity finishes.
+_HEARTBEAT_COORD_DICT_NAME = "modal-temporal-heartbeat-coord"
+_HEARTBEAT_QUEUED = "queued"
+_HEARTBEAT_STARTED = "started"
+
+# Keep references to in-flight dispatcher heartbeat loops so they are not
+# garbage-collected while running (asyncio only holds weak refs to tasks).
+_dispatcher_heartbeat_tasks: set[asyncio.Task] = set()
+
+
+@alru_cache(maxsize=1)
+async def get_heartbeat_coord_dict() -> modal.Dict:
+    return modal.Dict.from_name(_HEARTBEAT_COORD_DICT_NAME, create_if_missing=True)
+
 
 async def _auto_heartbeat_loop(
     handle: AsyncActivityHandle,
@@ -60,6 +77,34 @@ async def _auto_heartbeat_loop(
             print(f"[external worker] heartbeat failed: {e}")
             # Heartbeat failure usually means Temporal cancelled or expired the activity.
             activity_task.cancel()
+            return
+
+
+async def _dispatcher_heartbeat_loop(
+    handle: AsyncActivityHandle,
+    info: Info,
+    coord_dict: modal.Dict,
+) -> None:
+    """Heartbeat on behalf of an activity while it waits on Modal's input queue.
+
+    The dispatcher owns the heartbeat from the moment the activity is spawned
+    until a Modal worker picks it up. The worker signals takeover by writing
+    _HEARTBEAT_STARTED into the shared modal.Dict; completion removes the key
+    entirely. In either case this loop exits and the worker takes over."""
+    assert info.heartbeat_timeout is not None
+    key = info.task_token.hex()
+    interval = info.heartbeat_timeout.total_seconds() / 2.0
+    while True:
+        await asyncio.sleep(interval)
+        # Re-read each interval: the worker may have started (and is now
+        # responsible) or the activity may have finished (key removed).
+        if await coord_dict.get.aio(key) != _HEARTBEAT_QUEUED:
+            return
+        try:
+            await handle.heartbeat()
+            print(f"[dispatcher] heartbeat (queued) for {info.activity_type}")
+        except Exception as e:
+            print(f"[dispatcher] queued heartbeat failed for {info.activity_type}: {e}")
             return
 
 
@@ -106,7 +151,12 @@ async def run_activity_with_temporal(
 ):
     activity_task = asyncio.create_task(coro)
     heartbeat_task = None
+    coord_dict = None
     if info.heartbeat_timeout:
+        # Take over heartbeat duty from the dispatcher: mark the activity as
+        # started so the dispatcher's queue-side heartbeat loop steps down.
+        coord_dict = await get_heartbeat_coord_dict()
+        await coord_dict.put.aio(info.task_token.hex(), _HEARTBEAT_STARTED)
         heartbeat_task = asyncio.create_task(
             _auto_heartbeat_loop(
                 handle, activity_name, info.heartbeat_timeout, activity_task
@@ -127,6 +177,10 @@ async def run_activity_with_temporal(
     finally:
         if heartbeat_task:
             heartbeat_task.cancel()
+        if coord_dict is not None:
+            # Remove the coordination key so the dispatcher loop (if any is
+            # still alive) sees the activity is done and exits.
+            await coord_dict.pop.aio(info.task_token.hex(), None)
 
 
 @alru_cache(maxsize=1)
@@ -365,13 +419,30 @@ class DispatchActivityInterceptor(ActivityInboundInterceptor):
             assert isinstance(input.fn, types.MethodType)
             instance = input.fn.__self__
             modal_cls = await get_modal_cls(self._app_name, entry.modal_name)
-            handle = getattr(modal_cls(**vars(instance)), input.fn.__name__)
+            modal_handle = getattr(modal_cls(**vars(instance)), input.fn.__name__)
         else:
-            handle = await get_modal_function(self._app_name, entry.modal_name)
+            modal_handle = await get_modal_function(self._app_name, entry.modal_name)
+
+        # Heartbeat while the activity sits on Modal's input queue. Seed the
+        # coordination key BEFORE spawning so a fast-starting worker's
+        # _HEARTBEAT_STARTED is never clobbered by this "queued" marker.
+        if info.heartbeat_timeout:
+            await self._start_queue_heartbeat(info)
 
         print(f"[dispatcher] {info.activity_type} -> {entry.modal_name} args={args}")
-        await handle.spawn.aio(info, args)
+        await modal_handle.spawn.aio(info, args)
         activity.raise_complete_async()
+
+    async def _start_queue_heartbeat(self, info: Info) -> None:
+        client = await get_temporal_client()
+        coord_dict = await get_heartbeat_coord_dict()
+        await coord_dict.put.aio(info.task_token.hex(), _HEARTBEAT_QUEUED)
+        handle = client.get_async_activity_handle(task_token=info.task_token)
+        task = asyncio.create_task(
+            _dispatcher_heartbeat_loop(handle, info, coord_dict)
+        )
+        _dispatcher_heartbeat_tasks.add(task)
+        task.add_done_callback(_dispatcher_heartbeat_tasks.discard)
 
 
 class DispatchInterceptor(Interceptor):
